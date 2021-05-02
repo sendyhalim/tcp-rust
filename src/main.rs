@@ -1,26 +1,30 @@
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use tcp_rust::Quad;
+use tcp_rust::TcpConnection;
 use tcp_rust::TcpState;
 
 fn main() -> anyhow::Result<()> {
-  let network_interface = tun_tap::Iface::new("tun0", tun_tap::Mode::Tun)?;
+  let network_interface = tun_tap::Iface::without_packet_info("tun0", tun_tap::Mode::Tun)?;
   let mut buf = [0u8; 1604];
-  let mut connection_by_quad: HashMap<Quad, TcpState> = Default::default();
+  let mut connection_by_quad: HashMap<Quad, TcpConnection> = Default::default();
 
   loop {
     let nbytes = network_interface.recv(&mut buf[..])?;
+    let packet_info_len = 0;
+    // let packet_info_len = 4;
 
     // Data link protocol
-    let ethernet_frame_flags = u16::from_be_bytes([buf[0], buf[1]]);
-    let ethernet_frame_proto = u16::from_be_bytes([buf[2], buf[3]]);
+    // let ethernet_frame_flags = u16::from_be_bytes([buf[0], buf[1]]);
+    // let ethernet_frame_proto = u16::from_be_bytes([buf[2], buf[3]]);
 
-    if ethernet_frame_proto != 0x0800 {
-      // no ipv4
-      continue;
-    }
+    // if ethernet_frame_proto != 0x0800 {
+    // // no ipv4
+    // continue;
+    // }
 
     // IP Level protocol
-    match etherparse::Ipv4HeaderSlice::from_slice(&buf[4..nbytes]) {
+    match etherparse::Ipv4HeaderSlice::from_slice(&buf[packet_info_len..nbytes]) {
       Ok(ipv4_header) => {
         let iph_src = ipv4_header.source_addr();
         let iph_dst = ipv4_header.destination_addr();
@@ -31,7 +35,7 @@ fn main() -> anyhow::Result<()> {
           continue;
         }
 
-        let tcp_header_start_index = 4 + ipv4_header.slice().len() as usize;
+        let tcp_header_start_index = packet_info_len + ipv4_header.slice().len() as usize;
 
         match etherparse::TcpHeaderSlice::from_slice(&buf[tcp_header_start_index..nbytes]) {
           Ok(tcp_header) => {
@@ -39,18 +43,31 @@ fn main() -> anyhow::Result<()> {
             let dst_port = tcp_header.destination_port();
             let data_start_index = tcp_header_start_index + tcp_header.slice().len();
 
-            connection_by_quad
-              .entry(Quad {
-                src: (iph_src, src_port),
-                dst: (iph_dst, dst_port),
-              })
-              .or_default()
-              .on_packet(
-                &network_interface,
-                ipv4_header,
-                tcp_header,
-                &buf[data_start_index..],
-              )?;
+            let quad_entry = connection_by_quad.entry(Quad {
+              src: (iph_src, src_port),
+              dst: (iph_dst, dst_port),
+            });
+
+            match quad_entry {
+              Entry::Occupied(mut map_entry) => {
+                map_entry.get_mut().on_packet(
+                  &network_interface,
+                  ipv4_header,
+                  tcp_header,
+                  &buf[tcp_header_start_index..nbytes],
+                )?;
+              }
+              Entry::Vacant(map_entry) => {
+                if let Some(connection) = tcp_rust::TcpConnection::accept(
+                  &network_interface,
+                  ipv4_header,
+                  tcp_header,
+                  &buf[tcp_header_start_index..nbytes],
+                )? {
+                  map_entry.insert(connection);
+                }
+              }
+            }
           }
           Err(err) => {
             eprintln!("Ignoring weird TCP packet {:?}", err);
@@ -69,7 +86,7 @@ fn main() -> anyhow::Result<()> {
         eprintln!(
           "Ignoring weird ipv4 packet {:?} {:x?}",
           err,
-          &buf[4..nbytes]
+          &buf[packet_info_len..nbytes]
         );
       }
     }
