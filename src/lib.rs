@@ -1,6 +1,12 @@
 use std::io::Result;
 use std::net::Ipv4Addr;
 
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+pub struct Quad {
+  pub src: (Ipv4Addr, u16), // (ip address, port)
+  pub dst: (Ipv4Addr, u16),
+}
+
 pub enum TcpState {
   Closed,
   Listen,
@@ -197,8 +203,37 @@ impl TcpConnection {
   }
 }
 
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
-pub struct Quad {
-  pub src: (Ipv4Addr, u16), // (ip address, port)
-  pub dst: (Ipv4Addr, u16),
+fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
+  // | -- S --- X --- E -- |
+  if start < x {
+    return x < end ||
+    // or this case is true
+    // | -- E --- S --- X |
+        end < start;
+  }
+  // | -- X --- E --- S -- |
+  else if start > x {
+    return x < end && end < start;
+  }
+
+  return false;
+
+  // use std::cmp::Ordering;
+
+  // match start.cmp(x) {
+  //   Ordering::Equal => return false,
+  //   Ordering::Less => {
+  //     if end >= start && end < x {
+  //       return false;
+  //     }
+  //   }
+  //   Ordering::Greater => {
+  //     if end < start && end < x {
+  //     } else {
+  //       return false;
+  //     }
+  //   }
+  // }
+
+  // return true;
 }
