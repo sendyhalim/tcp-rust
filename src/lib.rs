@@ -109,14 +109,50 @@ impl TcpConnection {
     tcph: etherparse::TcpHeaderSlice<'a>,
     data: &'a [u8],
   ) -> Result<Option<Self>> {
-    let mut buf = [0u8; 1500];
+    let ack_number = tcph.acknowledgment_number();
 
-    // Not synchronized
-    if !tcph.syn() {
-      return Ok(None);
+    if !is_between_wrapped(self.send.una, ack_number, self.send.nxt.wrapping_add(1)) {
+      return Ok(());
     }
 
+    let seq_number = tcph.sequence_number();
+    let recv_nxt = connection.recv.nxt;
+    let nxt_and_wnd = recv_nxt + connection.recv.wnd;
+    let win_size = tcph.window_size();
+    let slen = data.len();
+
+    if tcph.fin() {
+      slen = slen + 1;
+    }
+
+    if tcph.syn() {
+      slen = slen + 1;
+    }
+
+    if slen == 0 {
+      if win_size == 0 && seg_sequence_number != recv_nxt {
+        return Ok(());
+      }
+
+      if win_size > 0 && !is_between_wrapped(recv_nxt.wrapping_sub(1), seq_number, nxt_and_wnd) {
+        return Ok(());
+      }
+    } else if slen > 0 {
+      if win_size == 0 {
+        return Ok(());
+      }
+
+      if win_size > 0
+        && !is_between_wrapped(recv_nxt.wrapping_sub(1), seq_number, nxt_and_wnd)
+        && !is_between_wrapped(recv_nxt.wrapping_sub(1), seq_number + slen - 1, nxt_and_wnd)
+      {
+        return Ok(());
+      }
+    }
+
+    let mut buf = [0u8; 1500];
     let iss = 0;
+    let seg_sequence_number = tcph.sequence_number();
     let mut connection = TcpConnection {
       state: TcpState::SynRcvd,
       send: SendSequenceSpace {
@@ -132,7 +168,7 @@ impl TcpConnection {
       },
       recv: RecvSequenceSpace {
         // Keep track of sender info
-        nxt: tcph.sequence_number() + 1,
+        nxt: seg_sequence_number + 1,
         wnd: tcph.window_size(),
         irs: tcph.sequence_number(),
         up: false,
