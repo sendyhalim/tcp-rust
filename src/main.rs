@@ -54,7 +54,7 @@ fn main() -> anyhow::Result<()> {
                   &network_interface,
                   ipv4_header,
                   tcp_header,
-                  &buf[tcp_header_start_index..nbytes],
+                  &buf[data_start_index..nbytes],
                 )?;
               }
               Entry::Vacant(map_entry) => {
@@ -62,7 +62,7 @@ fn main() -> anyhow::Result<()> {
                   &network_interface,
                   ipv4_header,
                   tcp_header,
-                  &buf[tcp_header_start_index..nbytes],
+                  &buf[data_start_index..nbytes],
                 )? {
                   map_entry.insert(connection);
                 }
