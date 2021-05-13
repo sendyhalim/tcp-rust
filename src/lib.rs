@@ -1,4 +1,5 @@
 use std::io::Result;
+use std::io::Write;
 use std::net::Ipv4Addr;
 
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
@@ -8,10 +9,20 @@ pub struct Quad {
 }
 
 pub enum TcpState {
-  Closed,
-  Listen,
+  FinWait1,
+  FinWait2,
   SynRcvd,
   Established, // ETAB
+  Closing,
+}
+
+impl TcpState {
+  pub fn is_synchronized(&self) -> bool {
+    return match *self {
+      TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2 | TcpState::Closing => true,
+      _ => false,
+    };
+  }
 }
 // TCP Header
 // 32 bit per lines ~> 4 bytes per line
@@ -100,6 +111,8 @@ pub struct TcpConnection {
   state: TcpState,
   recv: RecvSequenceSpace,
   send: SendSequenceSpace,
+  tcph: etherparse::TcpHeader,
+  iph: etherparse::Ipv4Header,
 }
 
 impl TcpConnection {
@@ -109,11 +122,89 @@ impl TcpConnection {
     tcph: etherparse::TcpHeaderSlice<'a>,
     data: &'a [u8],
   ) -> Result<Option<Self>> {
+    let buf = [0u8; 1500];
+
+    if !tcph.syn() {
+      // No SYN, not valid because we want SYN at first connection initiation step
+      Ok(None);
+    }
+
+    let iss = 0;
+
+    let mut connection = TcpConnection {
+      state: TcpState::SynRcvd,
+      send: SendSequenceSpace {
+        // Decide on stuff we're sending them
+        iss,
+        una: iss,
+        nxt: iss + 1,
+        wnd: 10,
+
+        up: false,
+        wl1: 0,
+        wl2: 0,
+      },
+      recv: RecvSequenceSpace {
+        // Keep track of sender info
+        nxt: tcph.sequence_number() + 1,
+        wnd: tcph.window_size(),
+        irs: tcph.sequence_number(),
+        up: false,
+      },
+
+      // Then we'll need to send back wrapped as ipv4 package
+      iph: etherparse::Ipv4Header::new(
+        0,
+        64, // In seconds based on spec
+        etherparse::IpTrafficClass::Tcp,
+        [
+          iph.destination()[0],
+          iph.destination()[1],
+          iph.destination()[2],
+          iph.destination()[3],
+        ],
+        [
+          iph.source()[0],
+          iph.source()[1],
+          iph.source()[2],
+          iph.source()[3],
+        ],
+      ),
+      tcph: etherparse::TcpHeader::new(
+        tcph.destination_port(),
+        tcph.source_port(),
+        connection.send.iss, // Sequence number
+        connection.send.wnd, // Window size
+      ),
+    };
+
+    self.tcph.syn = true;
+    self.tcph.ack = true;
+
+    connection.write(nic, &[])?;
+
+    return Ok(Some(connection));
+  }
+
+  pub fn on_packet<'a>(
+    &mut self,
+    nic: &tun_tap::Iface,
+    iph: etherparse::Ipv4HeaderSlice<'a>,
+    tcph: etherparse::TcpHeaderSlice<'a>,
+    data: &'a [u8],
+  ) -> Result<usize> {
     let ack_number = tcph.acknowledgment_number();
 
     if !is_between_wrapped(self.send.una, ack_number, self.send.nxt.wrapping_add(1)) {
+      if !self.state.is_synchronized() {
+        // According to reset generation (rfc) we should send reset
+        self.send_rst(nic);
+      }
+
       return Ok(());
-    }
+
+
+    self.snd.una = ack_number;
 
     let seq_number = tcph.sequence_number();
     let recv_nxt = connection.recv.nxt;
@@ -130,7 +221,7 @@ impl TcpConnection {
     }
 
     if slen == 0 {
-      if win_size == 0 && seg_sequence_number != recv_nxt {
+      if win_size == 0 && seq_number != recv_nxt {
         return Ok(());
       }
 
@@ -144,98 +235,114 @@ impl TcpConnection {
 
       if win_size > 0
         && !is_between_wrapped(recv_nxt.wrapping_sub(1), seq_number, nxt_and_wnd)
-        && !is_between_wrapped(recv_nxt.wrapping_sub(1), seq_number + slen - 1, nxt_and_wnd)
+        && !is_between_wrapped(
+          recv_nxt.wrapping_sub(1),
+          seq_number.wrapping_add(slen - 1),
+          nxt_and_wnd,
+        )
       {
         return Ok(());
       }
     }
 
-    let mut buf = [0u8; 1500];
-    let iss = 0;
-    let seg_sequence_number = tcph.sequence_number();
-    let mut connection = TcpConnection {
-      state: TcpState::SynRcvd,
-      send: SendSequenceSpace {
-        // Decide on stuff we're sending them
-        iss,
-        una: iss,
-        nxt: iss + 1,
-        wnd: 10,
+    self.recv.nxt = seq_number.wrapping_add(slen);
 
-        up: false,
-        wl1: 0,
-        wl2: 0,
-      },
-      recv: RecvSequenceSpace {
-        // Keep track of sender info
-        nxt: seg_sequence_number + 1,
-        wnd: tcph.window_size(),
-        irs: tcph.sequence_number(),
-        up: false,
-      },
-    };
+    match *self.state {
+      TcpState::SynRcvd => {
+        if !tcph.ack() {
+          return Ok(());
+        }
 
-    // First create a tcp header
-    let mut syn_ack = etherparse::TcpHeader::new(
-      tcph.destination_port(),
-      tcph.source_port(),
-      connection.send.iss, // Sequence number
-      connection.send.wnd, // Window size
-    );
+        // Must have acked our SYN, since we detected at least one acked byte, and we
+        // have only sent one byte (SYN)
+        self.state = State::Established;
 
-    syn_ack.acknowledgment_number = connection.recv.nxt;
-    syn_ack.syn = true;
-    syn_ack.ack = true;
+        // Just for testing
+        self.tcph.fin = true;
+        self.write(nic, &[]);
+        self.state = TcpState::FinWait1;
+      }
+      TcpState::Established => {
+        unimplemented!();
+      }
+      TcpState::FinWait1 => {
+        // We receive fin from the otherside.
+        // Not sure about this yet, why we're checking this
+        if !tcph.fin() || !data.is_empty() {
+          unimplemented!();
+        }
 
-    // Then we'll need to send back wrapped as ipv4 package
-    let mut ipv4header = etherparse::Ipv4Header::new(
-      syn_ack.header_len(),
-      64, // In seconds based on spec
-      etherparse::IpTrafficClass::Tcp,
-      [
-        iph.destination()[0],
-        iph.destination()[1],
-        iph.destination()[2],
-        iph.destination()[3],
-      ],
-      [
-        iph.source()[0],
-        iph.source()[1],
-        iph.source()[2],
-        iph.source()[3],
-      ],
-    );
+        // Must have acked our FIN, since we detected at least one acked byte, and we
+        // have only sent one byte (FIN)
+        self.tcph.fin = false;
+        self.write(nic, &[]);
+        self.state = TcpState::Closing;
+      }
+      TcpState::Closing => {
+        // At this state, we need to wait for our FIN to be acked by the otherside
+        // Not sure about this yet, why we're checking this
+        if !tcph.fin() || !data.is_empty() {
+          unimplemented!();
+        }
 
-    let written_count = {
-      let mut unwritten_buf = &mut buf[..];
-      ipv4header.write(&mut unwritten_buf);
-      syn_ack.write(&mut unwritten_buf);
-      unwritten_buf.len()
-    };
+        // Must have acked our FIN, since we detected at least one acked byte, and we
+        // have only sent one byte (FIN)
+        self.tcph.fin = false;
+        self.write(nic, &[]);
+        self.state = TcpState::Closing;
+      }
+    }
 
-    nic.send(&buf[..written_count])?;
-
-    return Ok(Some(connection));
-
-    // eprintln!(
-    // "{}:{} -> {}:{} {}b of  tcp",
-    // iph.source_addr(),
-    // tcph.source_port(),
-    // iph.destination_addr(),
-    // tcph.destination_port(),
-    // data.len()
-    // )
+    return Ok(());
   }
 
-  pub fn on_packet<'a>(
-    &mut self,
-    nic: &tun_tap::Iface,
-    iph: etherparse::Ipv4HeaderSlice<'a>,
-    tcph: etherparse::TcpHeaderSlice<'a>,
-    data: &'a [u8],
-  ) -> Result<usize> {
-    eprintln!("Foo {:02x?}", data);
-    return Ok(0);
+  fn send_rst(&mut self, nic: &mut tun_tap::Iface) -> io::Result<()> {
+    // TODO: Need to fix sequence number of our tcph according to RFC
+    self.tcph.rst = true;
+    self.tcph.sequence_number = 0;
+    self.tcph.acknowledgment_number = 0;
+    self.write(nic, &[]);
+
+    return Ok(());
+  }
+
+  fn write<'a>(&mut self, nic: &tun_tap::Iface, payload: &'a [u8]) -> io::Result<usize> {
+    let mut buf = [0u8; 1500];
+    self.tcph.sequence_number = self.send.nxt;
+    self.tcph.acknowledgment_number = self.recv.nxt;
+
+    let ip_payload_size = std::cmp::min(
+      buf.len(),
+      self.tcph.header_len() + self.iph.header_len() + payload.len(),
+    );
+    self.iph.set_payload_len(ip_payload_size);
+
+    let mut unwritten_buf = &mut buf[..];
+
+    // Write iph and tcph into unwritten_buf
+    self.iph.write(&mut unwritten_buf);
+    self.tcph.write(&mut unwritten_buf);
+
+    // Write into unwritten_buf, the "write" method is kind of different between headers and buf, go
+    // to function definition for more details
+    let written_payload_size = unwritten_buf.write(payload)?;
+    let unwritten_count = unwritten_buf.len()?;
+
+    self.send.nxt = self.send.nxt.wrapping_add(written_payload_size as usize);
+
+    if self.tcph.syn {
+      self.send.nxt = self.send.nxt.wrapping_add(1);
+      self.tcp.syn = false;
+    }
+
+    if self.tcph.fin {
+      self.send.nxt = self.send.nxt.wrapping_add(1);
+      self.tcp.syn = false;
+    }
+
+    nic.send(&buf[..buf.len() - unwritten_count])?;
+
+    return Ok(written_payload_size);
   }
 }
 
