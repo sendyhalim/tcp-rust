@@ -6,6 +6,8 @@ use std::net::Ipv4Addr;
 use std::sync::mpsc;
 use std::thread;
 
+type InterfaceHandle = mpsc::Sender<InterfaceRequest>;
+
 enum InterfaceRequest {
   Write {
     bytes: Vec<u8>,
@@ -26,7 +28,7 @@ enum InterfaceRequest {
 }
 
 pub struct Interface {
-  sender: mpsc::Sender<Interface>,
+  sender: InterfaceHandle,
   join_handle: thread::JoinHandle<()>,
 }
 
@@ -69,7 +71,7 @@ impl Interface {
 
 pub struct TcpListener {}
 
-pub struct TcpStream {}
+pub struct TcpStream(InterfaceHandle);
 
 impl Read for TcpStream {
   fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
