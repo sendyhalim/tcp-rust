@@ -10,3 +10,10 @@ edition = "2018"
 tun-tap = "0.1.2"
 etherparse = "0.8"
 anyhow = "1.0"
+
+[lib]
+name = "tcp_rust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tcp-rust"

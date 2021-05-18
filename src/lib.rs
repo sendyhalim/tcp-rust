@@ -1,6 +1,91 @@
+use std::collections::HashMap;
 use std::io;
+use std::io::Read;
 use std::io::Write;
 use std::net::Ipv4Addr;
+use std::sync::mpsc;
+use std::thread;
+
+enum InterfaceRequest {
+  Write {
+    bytes: Vec<u8>,
+    ack: mpsc::Sender<usize>,
+  },
+  Flush {
+    ack: mpsc::Sender<()>,
+  },
+  Bind {
+    port: u16,
+    ack: mpsc::Sender<()>,
+  },
+  Unbind,
+  Read {
+    max_length: usize,
+    read: mpsc::Sender<Vec<u8>>,
+  },
+}
+
+pub struct Interface {
+  sender: mpsc::Sender<Interface>,
+  join_handle: thread::JoinHandle<()>,
+}
+
+struct ConnectionManager {
+  connection_by_quad: HashMap<Quad, TcpConnection>,
+  nic: tun_tap::Iface,
+  buf: [u8; 1504],
+}
+
+impl ConnectionManager {
+  fn run_on(self, sender: mpsc::Sender<InterfaceRequest>) {
+    for req in sender {}
+  }
+}
+
+impl Interface {
+  pub fn new() -> io::Result<Self> {
+    let nic = tun_tap::Iface::without_packet_info("tun0", tun_tap::Mode::Tun)?;
+
+    let connection_manager = ConnectionManager {
+      connection_by_quad: Default::default(),
+      nic,
+      buf: [0u8; 1504],
+    };
+
+    let (sender, receiver) = mpsc::channel();
+
+    let join_handle = thread::spawn(move || connection_manager.run_on(receiver));
+
+    return Ok(Interface {
+      join_handle,
+      sender,
+    });
+  }
+
+  pub fn bind(&mut self, port: u16) -> io::Result<TcpListener> {
+    unimplemented!();
+  }
+}
+
+pub struct TcpListener {}
+
+pub struct TcpStream {}
+
+impl Read for TcpStream {
+  fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    unimplemented!();
+  }
+}
+
+impl Write for TcpStream {
+  fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    unimplemented!();
+  }
+
+  fn flush(&mut self) -> io::Result<()> {
+    unimplemented!();
+  }
+}
 
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub struct Quad {

@@ -1,14 +1,7 @@
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
 use tcp_rust::Quad;
-use tcp_rust::TcpConnection;
-use tcp_rust::TcpState;
 
 fn main() -> anyhow::Result<()> {
-  let network_interface = tun_tap::Iface::without_packet_info("tun0", tun_tap::Mode::Tun)?;
-  let mut buf = [0u8; 1604];
-  let mut connection_by_quad: HashMap<Quad, TcpConnection> = Default::default();
-
   loop {
     let nbytes = network_interface.recv(&mut buf[..])?;
     let packet_info_len = 0;
