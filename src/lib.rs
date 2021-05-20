@@ -1,48 +1,26 @@
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::net::Ipv4Addr;
 use std::sync::mpsc;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread;
 
-type InterfaceHandle = mpsc::Sender<InterfaceRequest>;
-
-enum InterfaceRequest {
-  Write {
-    quad: Quad,
-    bytes: Vec<u8>,
-    ack: mpsc::Sender<usize>,
-  },
-  Flush {
-    quad: Quad,
-    ack: mpsc::Sender<()>,
-  },
-  Bind {
-    port: u16,
-    ack: mpsc::Sender<()>,
-  },
-  Unbind,
-  Read {
-    quad: Quad,
-    max_length: usize,
-    read: mpsc::Sender<Vec<u8>>,
-  },
-  Accept {
-    port: u16,
-    ack: mpsc::Sender<Quad>,
-  },
-}
+type InterfaceHandle = Arc<Mutex<ConnectionManager>>;
 
 pub struct Interface {
   interface_handle: InterfaceHandle,
   join_handle: thread::JoinHandle<()>,
 }
 
+#[derive(Default)]
 struct ConnectionManager {
   connection_by_quad: HashMap<Quad, TcpConnection>,
-  nic: tun_tap::Iface,
-  buf: [u8; 1504],
+  pending_by_port: HashMap<u16, VecDeque<Quad>>,
 }
 
 impl ConnectionManager {
@@ -55,30 +33,41 @@ impl Interface {
   pub fn new() -> io::Result<Self> {
     let nic = tun_tap::Iface::without_packet_info("tun0", tun_tap::Mode::Tun)?;
 
-    let connection_manager = ConnectionManager {
-      connection_by_quad: Default::default(),
-      nic,
-      buf: [0u8; 1504],
+    let connection_manager: InterfaceHandle = Arc::default();
+
+    let join_handle = {
+      let cm = connection_manager.clone();
+
+      thread::spawn(move || {
+        let nic = nic;
+        let cm = cm;
+        let buf = [0u8; 1504];
+        // Follow stuff in main fn.
+      })
     };
-
-    let (sender, receiver) = mpsc::channel();
-
-    let join_handle = thread::spawn(move || connection_manager.run_on(sender));
 
     return Ok(Interface {
       join_handle,
-      interface_handle: sender,
+      interface_handle: connection_manager,
     });
   }
 
   pub fn bind(&mut self, port: u16) -> io::Result<TcpListener> {
-    let (sender, receiver) = mpsc::channel();
+    let connection_manager = self.interface_handle.lock().unwrap();
 
-    self
-      .interface_handle
-      .send(InterfaceRequest::Bind { port, ack: sender });
+    match connection_manager.pending_by_port.entry(port) {
+      Entry::Vacant(v) => {
+        v.insert(VecDeque::new());
+      }
+      Entry::Occupied(_) => {
+        return Err(io::Error::new(
+          io::ErrorKind::AddrInUse,
+          "port already bound",
+        ));
+      }
+    }
 
-    receiver.recv().unwrap();
+    drop(connection_manager);
 
     return Ok(TcpListener {
       port,
@@ -94,19 +83,24 @@ pub struct TcpListener {
 
 impl TcpListener {
   pub fn accept(&mut self) -> io::Result<TcpStream> {
-    let (sender, receiver) = mpsc::channel();
+    let connection_manager = self.interface_handle.lock().unwrap();
 
-    self.interface_handle.send(InterfaceRequest::Accept {
-      port: self.port,
-      ack: sender,
-    });
-
-    let quad: Quad = receiver.recv().unwrap();
-
-    return Ok(TcpStream {
-      quad,
-      interface_handle: self.interface_handle.clone(),
-    });
+    if let Some(quad) = connection_manager
+      .pending_by_port
+      .get_mut(&self.port)
+      .expect("port closed while listener is still active")
+      .pop_front()
+    {
+      return Ok(TcpStream {
+        quad,
+        interface_handle: self.interface_handle.clone(),
+      });
+    } else {
+      return Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "no connection to accept",
+      ));
+    }
   }
 }
 
@@ -117,16 +111,18 @@ pub struct TcpStream {
 
 impl Read for TcpStream {
   fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-    let (sender, receiver) = mpsc::channel();
+    let connection_manager = self.interface_handle.lock().unwrap();
+    let connection = connection_manager
+      .connection_by_quad
+      .get(&self.quad)
+      .ok_or_else(|| {
+        io::Error::new(
+          io::ErrorKind::ConnectionAborted,
+          "stream was terminated unexpectedly",
+        )
+      })?;
 
-    self.sender.send(InterfaceRequest::Read {
-      quad: self.quad,
-      max_length: buf.len(),
-      read: sender,
-    });
-
-    let bytes = receiver.recv().unwrap();
-
+    // TODO: Continue
     assert!(bytes.len() <= buf.len());
 
     // Read bytes and put it into buf
