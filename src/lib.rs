@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
 
+const SENDQUEUE_SIZE: usize = 1024;
+
 type InterfaceHandle = Arc<Mutex<ConnectionManager>>;
 
 pub struct Interface {
@@ -109,12 +111,19 @@ pub struct TcpStream {
   interface_handle: InterfaceHandle,
 }
 
+impl TcpStream {
+  pub fn shutdown(&mut self, how: std::net::Shutdown) -> io::Result<()> {
+    // Gonna send a FIN
+    unimplemented!();
+  }
+}
+
 impl Read for TcpStream {
   fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
     let connection_manager = self.interface_handle.lock().unwrap();
     let connection = connection_manager
       .connection_by_quad
-      .get(&self.quad)
+      .get_mut(&self.quad)
       .ok_or_else(|| {
         io::Error::new(
           io::ErrorKind::ConnectionAborted,
@@ -122,44 +131,82 @@ impl Read for TcpStream {
         )
       })?;
 
-    // TODO: Continue
-    assert!(bytes.len() <= buf.len());
+    if connection.incoming.is_empty() {
+      return Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "no bytes to read",
+      ));
+    }
 
-    // Read bytes and put it into buf
-    buf.copy_from_slice(&bytes[..]);
+    let mut byte_read_count = 0;
+    let (head, tail) = connection.incoming.as_slices();
 
-    return Ok(bytes.len());
+    // Read head first, make sure we don't overflow the given buffer
+    let hread_count = std::cmp::min(buf.len(), head.len());
+    buf.copy_from_slice(&head[..hread_count]);
+    byte_read_count += hread_count;
+
+    // Now read the tail of deque
+    let tread_count = std::cmp::min(buf.len() - hread_count, tail.len());
+    buf.copy_from_slice(&tail[..tread_count]);
+    byte_read_count += tread_count;
+
+    drop(connection.incoming.drain(..byte_read_count));
+
+    return Ok(byte_read_count);
   }
 }
 
 impl Write for TcpStream {
   fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-    let (sender, receiver) = mpsc::channel();
+    // TODO: Copied from read, adjust for Write operation
+    let connection_manager = self.interface_handle.lock().unwrap();
+    let connection = connection_manager
+      .connection_by_quad
+      .get_mut(&self.quad)
+      .ok_or_else(|| {
+        io::Error::new(
+          io::ErrorKind::ConnectionAborted,
+          "stream was terminated unexpectedly",
+        )
+      })?;
 
-    self.interface_handle.send(InterfaceRequest::Write {
-      quad: self.quad,
-      bytes: Vec::from(buf),
-      ack: sender,
-    });
+    if connection.outgoing.len() >= SENDQUEUE_SIZE {
+      return Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "too many bytes buffered",
+      ));
+    }
 
-    let bytes_written_count = receiver.recv().unwrap();
+    let nwrite = std::cmp::min(buf.len(), SENDQUEUE_SIZE - connection.outgoing.len());
+    connection.outgoing.extend(&buf[..nwrite]);
 
-    assert!(bytes_written_count <= buf.len());
+    // TODO: Wake up writer
 
-    return Ok(bytes_written_count);
+    return Ok(nwrite);
   }
 
   fn flush(&mut self) -> io::Result<()> {
-    let (sender, receiver) = mpsc::channel();
+    // TODO: Copied from read, adjust for Write operation
+    let connection_manager = self.interface_handle.lock().unwrap();
+    let connection = connection_manager
+      .connection_by_quad
+      .get_mut(&self.quad)
+      .ok_or_else(|| {
+        io::Error::new(
+          io::ErrorKind::ConnectionAborted,
+          "stream was terminated unexpectedly",
+        )
+      })?;
 
-    self.interface_handle.send(InterfaceRequest::Flush {
-      quad: self.quad,
-      ack: sender,
-    });
-
-    receiver.recv().unwrap();
-
-    return Ok(());
+    if connection.outgoing.is_empty() {
+      return Ok(());
+    } else {
+      return Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "too many bytes buffered",
+      ));
+    }
   }
 }
 
@@ -275,6 +322,9 @@ pub struct TcpConnection {
   recv: RecvSequenceSpace,
   iph: etherparse::Ipv4Header,
   tcph: etherparse::TcpHeader,
+
+  incoming: VecDeque<u8>,
+  outgoing: VecDeque<u8>,
 }
 
 impl TcpConnection {
