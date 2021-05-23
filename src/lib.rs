@@ -5,7 +5,6 @@ use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::net::Ipv4Addr;
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
@@ -14,21 +13,132 @@ const SENDQUEUE_SIZE: usize = 1024;
 
 type InterfaceHandle = Arc<Mutex<ConnectionManager>>;
 
+fn packet_loop(
+  mut network_interface: tun_tap::Iface,
+  interface_handle: InterfaceHandle,
+) -> std::io::Result<()> {
+  let mut buf = [0u8; 1504];
+
+  loop {
+    let nbytes = network_interface.recv(&mut buf[..])?;
+    let packet_info_len = 0;
+    // let packet_info_len = 4;
+
+    // Data link protocol
+    // let ethernet_frame_flags = u16::from_be_bytes([buf[0], buf[1]]);
+    // let ethernet_frame_proto = u16::from_be_bytes([buf[2], buf[3]]);
+
+    // if ethernet_frame_proto != 0x0800 {
+    // // no ipv4
+    // continue;
+    // }
+
+    // IP Level protocol
+    match etherparse::Ipv4HeaderSlice::from_slice(&buf[packet_info_len..nbytes]) {
+      Ok(ipv4_header) => {
+        let iph_src = ipv4_header.source_addr();
+        let iph_dst = ipv4_header.destination_addr();
+        let iph_proto = ipv4_header.protocol();
+
+        // Not TCP https://en.wikipedia.org/wiki/List_of_IP_protocol_numbers
+        if iph_proto != 0x06 {
+          continue;
+        }
+
+        let tcp_header_start_index = packet_info_len + ipv4_header.slice().len() as usize;
+
+        match etherparse::TcpHeaderSlice::from_slice(&buf[tcp_header_start_index..nbytes]) {
+          Ok(tcp_header) => {
+            let src_port = tcp_header.source_port();
+            let dst_port = tcp_header.destination_port();
+            let data_start_index = tcp_header_start_index + tcp_header.slice().len();
+            let mut connection_manager = interface_handle.lock().unwrap();
+
+            // So connection_manager is actually a mutex guard
+            // we need to deref it again explicitly here
+            // because if not then it will throw error due to
+            // we're trying to borrow twice when accessing:
+            // A) connection_manager.connection_by_quad.entry(quad)
+            // B) connection_manager.pending_by_port.get_mut(...)
+            //
+            // It's a different field but the mutext guard is guarding the whole
+            // connection manager. By dereferencing explicitly we're explicitly
+            // saying that we want the internal connection manager inside
+            // the mutex guard so point A & B is valid to the Rust's compiler.
+            let connection_manager = &mut *connection_manager;
+
+            let quad = Quad {
+              src: (iph_src, src_port),
+              dst: (iph_dst, dst_port),
+            };
+            let quad_entry = connection_manager.connection_by_quad.entry(quad);
+
+            match quad_entry {
+              Entry::Occupied(mut map_entry) => {
+                map_entry.get_mut().on_packet(
+                  &network_interface,
+                  ipv4_header,
+                  tcp_header,
+                  &buf[data_start_index..nbytes],
+                )?;
+              }
+              Entry::Vacant(map_entry) => {
+                if let Some(pending) = connection_manager
+                  .pending_by_port
+                  .get_mut(&tcp_header.destination_port())
+                {
+                  if let Some(connection) = TcpConnection::accept(
+                    &network_interface,
+                    ipv4_header,
+                    tcp_header,
+                    &buf[data_start_index..nbytes],
+                  )? {
+                    map_entry.insert(connection);
+                    pending.push_back(quad);
+                  }
+                }
+              }
+            }
+          }
+          Err(err) => {
+            eprintln!("Ignoring weird TCP packet {:?}", err);
+          }
+        }
+
+        // eprintln!(
+        // "read {} bytes (flags: {:x}, proto: {:x}): {:x?}",
+        // nbytes - 4,
+        // ethernet_frame_flags,
+        // ethernet_frame_proto,
+        // &buf[4..nbytes]
+        // );
+      }
+      Err(err) => {
+        eprintln!(
+          "Ignoring weird ipv4 packet {:?} {:x?}",
+          err,
+          &buf[packet_info_len..nbytes]
+        );
+      }
+    }
+  }
+}
+
 pub struct Interface {
   interface_handle: InterfaceHandle,
-  join_handle: thread::JoinHandle<()>,
+  join_handle: thread::JoinHandle<io::Result<()>>,
+}
+
+impl Drop for Interface {
+  fn drop(&mut self) {
+    unimplemented!();
+  }
 }
 
 #[derive(Default)]
 struct ConnectionManager {
   connection_by_quad: HashMap<Quad, TcpConnection>,
   pending_by_port: HashMap<u16, VecDeque<Quad>>,
-}
-
-impl ConnectionManager {
-  fn run_on(self, interface_handle: InterfaceHandle) {
-    for req in interface_handle {}
-  }
 }
 
 impl Interface {
@@ -38,14 +148,9 @@ impl Interface {
     let connection_manager: InterfaceHandle = Arc::default();
 
     let join_handle = {
-      let cm = connection_manager.clone();
+      let connection_manager = connection_manager.clone();
 
-      thread::spawn(move || {
-        let nic = nic;
-        let cm = cm;
-        let buf = [0u8; 1504];
-        // Follow stuff in main fn.
-      })
+      thread::spawn(move || packet_loop(nic, connection_manager))
     };
 
     return Ok(Interface {
@@ -55,7 +160,7 @@ impl Interface {
   }
 
   pub fn bind(&mut self, port: u16) -> io::Result<TcpListener> {
-    let connection_manager = self.interface_handle.lock().unwrap();
+    let mut connection_manager = self.interface_handle.lock().unwrap();
 
     match connection_manager.pending_by_port.entry(port) {
       Entry::Vacant(v) => {
@@ -85,7 +190,7 @@ pub struct TcpListener {
 
 impl TcpListener {
   pub fn accept(&mut self) -> io::Result<TcpStream> {
-    let connection_manager = self.interface_handle.lock().unwrap();
+    let mut connection_manager = self.interface_handle.lock().unwrap();
 
     if let Some(quad) = connection_manager
       .pending_by_port
@@ -111,6 +216,12 @@ pub struct TcpStream {
   interface_handle: InterfaceHandle,
 }
 
+impl Drop for TcpStream {
+  fn drop(&mut self) {
+    unimplemented!();
+  }
+}
+
 impl TcpStream {
   pub fn shutdown(&mut self, how: std::net::Shutdown) -> io::Result<()> {
     // Gonna send a FIN
@@ -120,7 +231,7 @@ impl TcpStream {
 
 impl Read for TcpStream {
   fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-    let connection_manager = self.interface_handle.lock().unwrap();
+    let mut connection_manager = self.interface_handle.lock().unwrap();
     let connection = connection_manager
       .connection_by_quad
       .get_mut(&self.quad)
@@ -160,7 +271,7 @@ impl Read for TcpStream {
 impl Write for TcpStream {
   fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
     // TODO: Copied from read, adjust for Write operation
-    let connection_manager = self.interface_handle.lock().unwrap();
+    let mut connection_manager = self.interface_handle.lock().unwrap();
     let connection = connection_manager
       .connection_by_quad
       .get_mut(&self.quad)
@@ -188,7 +299,7 @@ impl Write for TcpStream {
 
   fn flush(&mut self) -> io::Result<()> {
     // TODO: Copied from read, adjust for Write operation
-    let connection_manager = self.interface_handle.lock().unwrap();
+    let mut connection_manager = self.interface_handle.lock().unwrap();
     let connection = connection_manager
       .connection_by_quad
       .get_mut(&self.quad)
@@ -323,8 +434,8 @@ pub struct TcpConnection {
   iph: etherparse::Ipv4Header,
   tcph: etherparse::TcpHeader,
 
-  incoming: VecDeque<u8>,
-  outgoing: VecDeque<u8>,
+  pub(crate) incoming: VecDeque<u8>,
+  pub(crate) outgoing: VecDeque<u8>,
 }
 
 impl TcpConnection {
@@ -345,6 +456,8 @@ impl TcpConnection {
     let wnd = 1024;
 
     let mut connection = TcpConnection {
+      incoming: Default::default(),
+      outgoing: Default::default(),
       state: TcpState::SynRcvd,
       send: SendSequenceSpace {
         // Decide on stuff we're sending them
