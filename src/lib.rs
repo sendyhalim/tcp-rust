@@ -6,12 +6,19 @@ use std::io::Read;
 use std::io::Write;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
 use std::thread;
 
 const SENDQUEUE_SIZE: usize = 1024;
 
-type InterfaceHandle = Arc<Mutex<ConnectionManager>>;
+#[derive(Default)]
+struct FooBar {
+  connection_manager: Mutex<ConnectionManager>,
+  pending_var: Condvar,
+}
+
+type InterfaceHandle = Arc<FooBar>;
 
 fn packet_loop(
   mut network_interface: tun_tap::Iface,
@@ -20,8 +27,13 @@ fn packet_loop(
   let mut buf = [0u8; 1504];
 
   loop {
+    // Set timeout for this recv for TCP timers or ConnectionManager::terminate
     let nbytes = network_interface.recv(&mut buf[..])?;
     let packet_info_len = 0;
+
+    // If self.terminate && Arc::get_strong_refs(interface_handle) == 1; then
+    // tear down all connections and return (stop the loop).
+
     // let packet_info_len = 4;
 
     // Data link protocol
@@ -52,7 +64,7 @@ fn packet_loop(
             let src_port = tcp_header.source_port();
             let dst_port = tcp_header.destination_port();
             let data_start_index = tcp_header_start_index + tcp_header.slice().len();
-            let mut connection_manager = interface_handle.lock().unwrap();
+            let mut connection_manager_lock = interface_handle.connection_manager.lock().unwrap();
 
             // So connection_manager is actually a mutex guard
             // we need to deref it again explicitly here
@@ -65,7 +77,7 @@ fn packet_loop(
             // connection manager. By dereferencing explicitly we're explicitly
             // saying that we want the internal connection manager inside
             // the mutex guard so point A & B is valid to the Rust's compiler.
-            let connection_manager = &mut *connection_manager;
+            let connection_manager = &mut *connection_manager_lock;
 
             let quad = Quad {
               src: (iph_src, src_port),
@@ -95,6 +107,11 @@ fn packet_loop(
                   )? {
                     map_entry.insert(connection);
                     pending.push_back(quad);
+
+                    // Drop the lock first so it can be used when the blocked
+                    // statements are unblocked.
+                    drop(connection_manager_lock);
+                    interface_handle.pending_var.notify_all();
                   }
                 }
               }
@@ -125,18 +142,36 @@ fn packet_loop(
 }
 
 pub struct Interface {
-  interface_handle: InterfaceHandle,
-  join_handle: thread::JoinHandle<io::Result<()>>,
+  interface_handle: Option<InterfaceHandle>,
+  join_handle: Option<thread::JoinHandle<io::Result<()>>>,
 }
 
 impl Drop for Interface {
   fn drop(&mut self) {
-    unimplemented!();
+    self
+      .interface_handle
+      .as_mut()
+      .unwrap()
+      .connection_manager
+      .lock()
+      .unwrap()
+      .terminate = true;
+
+    drop(self.interface_handle.take());
+
+    self
+      .join_handle
+      .take()
+      .expect("interface dropped more than once")
+      .join()
+      .unwrap()
+      .unwrap();
   }
 }
 
 #[derive(Default)]
 struct ConnectionManager {
+  terminate: bool,
   connection_by_quad: HashMap<Quad, TcpConnection>,
   pending_by_port: HashMap<u16, VecDeque<Quad>>,
 }
@@ -154,13 +189,19 @@ impl Interface {
     };
 
     return Ok(Interface {
-      join_handle,
-      interface_handle: connection_manager,
+      join_handle: Some(join_handle),
+      interface_handle: Some(connection_manager),
     });
   }
 
   pub fn bind(&mut self, port: u16) -> io::Result<TcpListener> {
-    let mut connection_manager = self.interface_handle.lock().unwrap();
+    let mut connection_manager = self
+      .interface_handle
+      .as_mut()
+      .unwrap()
+      .connection_manager
+      .lock()
+      .unwrap();
 
     match connection_manager.pending_by_port.entry(port) {
       Entry::Vacant(v) => {
@@ -178,7 +219,7 @@ impl Interface {
 
     return Ok(TcpListener {
       port,
-      interface_handle: self.interface_handle.clone(),
+      interface_handle: self.interface_handle.as_mut().unwrap().clone(),
     });
   }
 }
@@ -188,25 +229,43 @@ pub struct TcpListener {
   interface_handle: InterfaceHandle,
 }
 
+impl Drop for TcpListener {
+  fn drop(&mut self) {
+    let mut connection_manager = self.interface_handle.connection_manager.lock().unwrap();
+
+    let pending = connection_manager
+      .pending_by_port
+      .remove(&self.port)
+      .expect("port closed while listener is still active");
+
+    for quad in pending {
+      unimplemented!();
+    }
+  }
+}
+
 impl TcpListener {
   pub fn accept(&mut self) -> io::Result<TcpStream> {
-    let mut connection_manager = self.interface_handle.lock().unwrap();
+    let mut connection_manager = self.interface_handle.connection_manager.lock().unwrap();
 
-    if let Some(quad) = connection_manager
-      .pending_by_port
-      .get_mut(&self.port)
-      .expect("port closed while listener is still active")
-      .pop_front()
-    {
-      return Ok(TcpStream {
-        quad,
-        interface_handle: self.interface_handle.clone(),
-      });
-    } else {
-      return Err(io::Error::new(
-        io::ErrorKind::WouldBlock,
-        "no connection to accept",
-      ));
+    loop {
+      if let Some(quad) = connection_manager
+        .pending_by_port
+        .get_mut(&self.port)
+        .expect("port closed while listener is still active")
+        .pop_front()
+      {
+        return Ok(TcpStream {
+          quad,
+          interface_handle: self.interface_handle.clone(),
+        });
+      }
+
+      connection_manager = self
+        .interface_handle
+        .pending_var
+        .wait(connection_manager)
+        .unwrap();
     }
   }
 }
@@ -218,7 +277,9 @@ pub struct TcpStream {
 
 impl Drop for TcpStream {
   fn drop(&mut self) {
-    unimplemented!();
+    let mut connection_manager = self.interface_handle.connection_manager.lock().unwrap();
+
+    if let Some(connection) = connection_manager.connection_by_quad.remove(&self.quad) {}
   }
 }
 
@@ -231,7 +292,7 @@ impl TcpStream {
 
 impl Read for TcpStream {
   fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-    let mut connection_manager = self.interface_handle.lock().unwrap();
+    let mut connection_manager = self.interface_handle.connection_manager.lock().unwrap();
     let connection = connection_manager
       .connection_by_quad
       .get_mut(&self.quad)
@@ -271,7 +332,7 @@ impl Read for TcpStream {
 impl Write for TcpStream {
   fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
     // TODO: Copied from read, adjust for Write operation
-    let mut connection_manager = self.interface_handle.lock().unwrap();
+    let mut connection_manager = self.interface_handle.connection_manager.lock().unwrap();
     let connection = connection_manager
       .connection_by_quad
       .get_mut(&self.quad)
@@ -299,7 +360,7 @@ impl Write for TcpStream {
 
   fn flush(&mut self) -> io::Result<()> {
     // TODO: Copied from read, adjust for Write operation
-    let mut connection_manager = self.interface_handle.lock().unwrap();
+    let mut connection_manager = self.interface_handle.connection_manager.lock().unwrap();
     let connection = connection_manager
       .connection_by_quad
       .get_mut(&self.quad)
