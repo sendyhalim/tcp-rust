@@ -1,3 +1,4 @@
+use bitflags::bitflags;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -16,6 +17,7 @@ const SENDQUEUE_SIZE: usize = 1024;
 struct FooBar {
   connection_manager: Mutex<ConnectionManager>,
   pending_var: Condvar,
+  rcv_var: Condvar,
 }
 
 type InterfaceHandle = Arc<FooBar>;
@@ -87,12 +89,26 @@ fn packet_loop(
 
             match quad_entry {
               Entry::Occupied(mut map_entry) => {
-                map_entry.get_mut().on_packet(
+                let readyAction = map_entry.get_mut().on_packet(
                   &network_interface,
                   ipv4_header,
                   tcp_header,
                   &buf[data_start_index..nbytes],
                 )?;
+
+                drop(connection_manager_lock);
+
+                if readyAction.contains(PacketReadyAction::READ) {
+                  interface_handle.rcv_var.notify_all();
+                }
+
+                if readyAction.contains(PacketReadyAction::WRITE) {
+                  // interface_handle.snd_var.notify_all();
+                }
+
+                // if let PacketReadyAction::Write | PacketReadyAction::ReadWrite = readyAction {
+                // interface_handle.snd_var.notify_all();
+                // }
               }
               Entry::Vacant(map_entry) => {
                 if let Some(pending) = connection_manager
@@ -293,39 +309,51 @@ impl TcpStream {
 impl Read for TcpStream {
   fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
     let mut connection_manager = self.interface_handle.connection_manager.lock().unwrap();
-    let connection = connection_manager
-      .connection_by_quad
-      .get_mut(&self.quad)
-      .ok_or_else(|| {
-        io::Error::new(
-          io::ErrorKind::ConnectionAborted,
-          "stream was terminated unexpectedly",
-        )
-      })?;
 
-    if connection.incoming.is_empty() {
-      return Err(io::Error::new(
-        io::ErrorKind::WouldBlock,
-        "no bytes to read",
-      ));
+    loop {
+      let connection = connection_manager
+        .connection_by_quad
+        .get_mut(&self.quad)
+        .ok_or_else(|| {
+          io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "stream was terminated unexpectedly",
+          )
+        })?;
+
+      if connection.is_recv_closed() && connection.incoming.is_empty() {
+        // No more data to read and no need to block
+        // because there won't be no data in the future because the otherside
+        // of TCP already sent FIN at this point.
+        return Ok(0);
+      }
+
+      if !connection.incoming.is_empty() {
+        let mut byte_read_count = 0;
+        let (head, tail) = connection.incoming.as_slices();
+
+        // Read head first, make sure we don't overflow the given buffer
+        let hread_count = std::cmp::min(buf.len(), head.len());
+        buf.copy_from_slice(&head[..hread_count]);
+        byte_read_count += hread_count;
+
+        // Now read the tail of deque
+        let tread_count = std::cmp::min(buf.len() - hread_count, tail.len());
+        buf.copy_from_slice(&tail[..tread_count]);
+        byte_read_count += tread_count;
+
+        drop(connection.incoming.drain(..byte_read_count));
+
+        return Ok(byte_read_count);
+      }
+
+      // Need to wait until data is there
+      connection_manager = self
+        .interface_handle
+        .rcv_var
+        .wait(connection_manager)
+        .unwrap();
     }
-
-    let mut byte_read_count = 0;
-    let (head, tail) = connection.incoming.as_slices();
-
-    // Read head first, make sure we don't overflow the given buffer
-    let hread_count = std::cmp::min(buf.len(), head.len());
-    buf.copy_from_slice(&head[..hread_count]);
-    byte_read_count += hread_count;
-
-    // Now read the tail of deque
-    let tread_count = std::cmp::min(buf.len() - hread_count, tail.len());
-    buf.copy_from_slice(&tail[..tread_count]);
-    byte_read_count += tread_count;
-
-    drop(connection.incoming.drain(..byte_read_count));
-
-    return Ok(byte_read_count);
   }
 }
 
@@ -386,6 +414,13 @@ impl Write for TcpStream {
 pub struct Quad {
   pub src: (Ipv4Addr, u16), // (ip address, port)
   pub dst: (Ipv4Addr, u16),
+}
+
+bitflags! {
+    pub(crate) struct PacketReadyAction: u8 {
+        const READ = 0b00000001;
+        const WRITE = 0b00000010;
+    }
 }
 
 #[derive(Debug)]
@@ -500,6 +535,24 @@ pub struct TcpConnection {
 }
 
 impl TcpConnection {
+  pub(crate) fn is_recv_closed(&self) -> bool {
+    if let TcpState::TimeWait = self.state {
+      return true;
+    }
+
+    return false;
+  }
+
+  pub(crate) fn packet_ready_action(&self) -> PacketReadyAction {
+    let mut ready_action = PacketReadyAction::empty();
+
+    if self.is_recv_closed() || !self.incoming.is_empty() {
+      ready_action |= PacketReadyAction::READ;
+    }
+
+    return ready_action;
+  }
+
   pub fn accept<'a>(
     nic: &tun_tap::Iface,
     iph: etherparse::Ipv4HeaderSlice<'a>,
@@ -572,13 +625,13 @@ impl TcpConnection {
     return Ok(Some(connection));
   }
 
-  pub fn on_packet<'a>(
+  pub(crate) fn on_packet<'a>(
     &mut self,
     nic: &tun_tap::Iface,
     iph: etherparse::Ipv4HeaderSlice<'a>,
     tcph: etherparse::TcpHeaderSlice<'a>,
     data: &'a [u8],
-  ) -> io::Result<()> {
+  ) -> io::Result<PacketReadyAction> {
     eprintln!("ON PACKET, current state: {:?}", self.state);
     let seq_number = tcph.sequence_number();
     let mut slen = data.len() as u32;
@@ -657,14 +710,14 @@ impl TcpConnection {
     if !okay {
       eprintln!("Not ok will return");
       self.write(nic, &[])?;
-      return Ok(());
+      return Ok(self.packet_ready_action());
     }
 
     self.recv.nxt = seq_number.wrapping_add(slen);
 
     if !tcph.ack() {
       eprintln!("NO ACK flag set, will return");
-      return Ok(());
+      return Ok(self.packet_ready_action());
     }
 
     if let TcpState::SynRcvd = self.state {
@@ -682,13 +735,11 @@ impl TcpConnection {
     }
 
     if let TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2 = self.state {
-      if !is_between_wrapped(self.send.una, ack_number, self.send.nxt.wrapping_add(1)) {
-        return Ok(());
+      if is_between_wrapped(self.send.una, ack_number, self.send.nxt.wrapping_add(1)) {
+        self.send.una = ack_number;
       }
 
-      self.send.una = ack_number;
-
-      // TODO: will take a look again later
+      // TODO: will take a look again later, read data
 
       assert!(data.is_empty());
 
@@ -722,7 +773,7 @@ impl TcpConnection {
       }
     }
 
-    return Ok(());
+    return Ok(self.packet_ready_action());
   }
 
   fn send_rst(&mut self, nic: &tun_tap::Iface) -> io::Result<()> {
