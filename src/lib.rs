@@ -343,12 +343,12 @@ impl Read for TcpStream {
 
         // Read head first, make sure we don't overflow the given buffer
         let hread_count = std::cmp::min(buf.len(), head.len());
-        buf.copy_from_slice(&head[..hread_count]);
+        buf[..hread_count].copy_from_slice(&head[..hread_count]);
         byte_read_count += hread_count;
 
         // Now read the tail of deque
-        let tread_count = std::cmp::min(buf.len() - hread_count, tail.len());
-        buf.copy_from_slice(&tail[..tread_count]);
+        let tread_count = std::cmp::min(buf.len() - byte_read_count, tail.len());
+        buf[hread_count..(hread_count + tread_count)].copy_from_slice(&tail[..tread_count]);
         byte_read_count += tread_count;
 
         drop(connection.incoming.drain(..byte_read_count));

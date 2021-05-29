@@ -306,9 +306,13 @@ impl TcpConnection {
       return Ok(self.packet_ready_action());
     }
 
-    self.recv.nxt = seq_number.wrapping_add(slen);
-
     if !tcph.ack() {
+      // Got SYNc for initial handshake
+      if tcph.syn() {
+        assert!(data.is_empty());
+        self.recv.nxt = seq_number.wrapping_add(1);
+      }
+
       eprintln!("NO ACK flag set, will return");
       return Ok(self.packet_ready_action());
     }
@@ -332,12 +336,13 @@ impl TcpConnection {
         self.send.una = ack_number;
       }
 
-      // TODO: will take a look again later, read data
-
-      assert!(data.is_empty());
+      // TODO: prune self.unacked that have been acknowledged by the otherside
+      // TODO: If unacked empty and waiting flush, notify
+      // TODO: Update window
 
       // Just for testing, we'll terminate the connection (going into FIN state)
-      eprintln!("CONNECTION is ESTABLISHED, will send FIN");
+      // eprintln!("CONNECTION is ESTABLISHED, will send FIN");
+      // FIXME: Not suppring write yet, so sending FIN should be fine
       if let TcpState::Established = self.state {
         self.tcph.fin = true;
         self.write(nic, &[])?;
@@ -352,6 +357,31 @@ impl TcpConnection {
         eprintln!("THEY'VE ACKED OUR FIN");
         self.state = TcpState::FinWait2;
       }
+    }
+
+    if let TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2 = self.state {
+      // TODO: will take a look again later, read data
+
+      // Readers will be awoken automatically
+      // because we've checked the self.incoming size at self.ready_action();
+      let mut data_offset = (self.recv.nxt - seq_number) as usize;
+
+      // Guard
+      // We must have received a re-transmitted FIN that we've already seen
+      // nxt points to beyond the fin but the fin is not in the data.
+      if data_offset > data.len() {
+        assert_eq!(data_offset, data.len() + 1);
+        data_offset = 0;
+      }
+
+      self.incoming.extend(&data[data_offset..]);
+
+      self.recv.nxt = seq_number
+        .wrapping_add(data.len() as u32)
+        .wrapping_add(if tcph.fin() { 1 } else { 0 });
+
+      // Send acknowledgement
+      self.write(nic, &[])?;
     }
 
     if tcph.fin() {

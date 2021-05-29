@@ -8,13 +8,17 @@ fn main() -> std::io::Result<()> {
 
   let jh1 = thread::spawn(move || {
     while let Ok(mut stream) = l1.accept() {
+      let mut buf = [0; 512];
+
       eprintln!("Got connection at port 9000");
 
-      let n = stream.read(&mut [0]).unwrap();
+      let n = stream.read(&mut buf[..]).unwrap();
 
-      eprintln!("Got data {} bytes!", n);
-
-      assert_eq!(n, 0);
+      if n == 0 {
+        eprintln!("No more data, read {} bytes", n);
+      } else {
+        eprintln!("Got data {:?} bytes!", &buf[..n]);
+      }
     }
   });
 
