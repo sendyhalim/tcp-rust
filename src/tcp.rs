@@ -117,7 +117,13 @@ pub struct TcpConnection {
   iph: etherparse::Ipv4Header,
   tcph: etherparse::TcpHeader,
 
+  // Bytes that we've recieved from the other side of TCP
+  // but our caller (lib) haven't read yet
   pub(crate) incoming: VecDeque<u8>,
+
+  // Bytes that we've sent to the other side of TCP
+  // but they haven't ack-ed yet. We have these for
+  // TCP retransmission purposes.
   pub(crate) outgoing: VecDeque<u8>,
 }
 
