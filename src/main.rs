@@ -12,12 +12,15 @@ fn main() -> std::io::Result<()> {
 
       eprintln!("Got connection at port 9000");
 
-      let n = stream.read(&mut buf[..]).unwrap();
+      loop {
+        let n = stream.read(&mut buf[..]).unwrap();
 
-      if n == 0 {
-        eprintln!("No more data, read {} bytes", n);
-      } else {
-        eprintln!("Got data {:?} bytes!", &buf[..n]);
+        if n == 0 {
+          eprintln!("No more data, read {} bytes", n);
+          break;
+        } else {
+          eprintln!("Data: {}", std::str::from_utf8(&buf[..n]).unwrap());
+        }
       }
     }
   });

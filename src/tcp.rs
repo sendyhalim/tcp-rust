@@ -117,6 +117,8 @@ pub struct TcpConnection {
   iph: etherparse::Ipv4Header,
   tcph: etherparse::TcpHeader,
 
+  timers: Timers,
+
   // Bytes that we've recieved from the other side of TCP
   // but our caller (lib) haven't read yet
   pub(crate) incoming: VecDeque<u8>,
@@ -125,6 +127,12 @@ pub struct TcpConnection {
   // but they haven't ack-ed yet. We have these for
   // TCP retransmission purposes.
   pub(crate) outgoing: VecDeque<u8>,
+
+  pub(crate) closed: bool,
+}
+
+struct Timers {
+  last_send: std::time::Instant,
 }
 
 impl TcpConnection {
@@ -163,6 +171,10 @@ impl TcpConnection {
     let wnd = 1024;
 
     let mut connection = TcpConnection {
+      closed: false,
+      timers: Timers {
+        last_send: std::time::Instant::now(),
+      },
       incoming: Default::default(),
       outgoing: Default::default(),
       state: TcpState::SynRcvd,
@@ -216,6 +228,13 @@ impl TcpConnection {
     connection.write(nic, &[])?;
 
     return Ok(Some(connection));
+  }
+
+  pub(crate) fn on_tick<'a>(&mut self, nic: &tun_tap::Iface) -> io::Result<()> {
+    let unacked_count = self.send.nxt.wrapping_sub(self.send.una);
+    let unsent = self.outgoing.len() - unacked_count as usize;
+
+    return Ok(());
   }
 
   pub(crate) fn on_packet<'a>(

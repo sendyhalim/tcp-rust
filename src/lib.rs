@@ -5,6 +5,7 @@ use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::net::Ipv4Addr;
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -38,6 +39,27 @@ fn packet_loop(
   let mut buf = [0u8; 1504];
 
   loop {
+    let mut pfd = [nix::poll::PollFd::new(
+      network_interface.as_raw_fd(),
+      nix::poll::PollFlags::POLLIN,
+    )];
+
+    let n = nix::poll::poll(&mut pfd[..], 1).map_err(|e| e.as_errno().unwrap())?;
+
+    assert_ne!(n, -1);
+
+    if n == 0 {
+      // println!("TIMERS");
+      continue;
+      // let mut cmg = interface_handle.connection_manager.lock().unwrap();
+
+      // for connection in cmg.values() {
+      // connection.on_tick(&mut network_interface);
+      // }
+    }
+
+    assert_eq!(n, 1);
+
     // Set timeout for this recv for TCP timers or ConnectionManager::terminate
     let nbytes = network_interface.recv(&mut buf[..])?;
     let packet_info_len = 0;
@@ -310,8 +332,20 @@ impl Drop for TcpStream {
 
 impl TcpStream {
   pub fn shutdown(&mut self, how: std::net::Shutdown) -> io::Result<()> {
-    // Gonna send a FIN
-    unimplemented!();
+    let mut connection_manager = self.interface_handle.connection_manager.lock().unwrap();
+    let connection = connection_manager
+      .connection_by_quad
+      .get_mut(&self.quad)
+      .ok_or_else(|| {
+        io::Error::new(
+          io::ErrorKind::ConnectionAborted,
+          "stream was terminated unexpectedly",
+        )
+      })?;
+
+    connection.closed = true;
+
+    return Ok(());
   }
 }
 
