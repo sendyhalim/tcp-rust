@@ -1,7 +1,9 @@
+// LATEST STREAM: Want to skip vecdeque of outgoing by nunacked (ontick)
 use bitflags::bitflags;
 use std::collections::VecDeque;
 use std::io;
 use std::io::Write;
+use std::time;
 
 bitflags! {
     pub(crate) struct PacketReadyAction: u8 {
@@ -129,10 +131,13 @@ pub struct TcpConnection {
   pub(crate) outgoing: VecDeque<u8>,
 
   pub(crate) closed: bool,
+  closed_at: Option<u32>,
 }
 
 struct Timers {
-  last_send: std::time::Instant,
+  last_send: time::Instant,
+  send_times: VecDeque<(u32, time::Instant)>,
+  srtt: time::Duration,
 }
 
 impl TcpConnection {
@@ -171,9 +176,12 @@ impl TcpConnection {
     let wnd = 1024;
 
     let mut connection = TcpConnection {
+      closed_at: None,
       closed: false,
       timers: Timers {
         last_send: std::time::Instant::now(),
+        send_times: Default::default(),
+        srtt: time::Duration::from_secs(60),
       },
       incoming: Default::default(),
       outgoing: Default::default(),
@@ -225,14 +233,63 @@ impl TcpConnection {
     connection.tcph.syn = true;
     connection.tcph.ack = true;
 
-    connection.write(nic, &[])?;
+    connection.write(nic, connection.send.nxt, &[], &[], 0)?;
 
     return Ok(Some(connection));
   }
 
   pub(crate) fn on_tick<'a>(&mut self, nic: &tun_tap::Iface) -> io::Result<()> {
     let unacked_count = self.send.nxt.wrapping_sub(self.send.una);
-    let unsent = self.outgoing.len() - unacked_count as usize;
+    let unsent = self.outgoing.len() as u32 - unacked_count;
+
+    let waited_for = self.timers.last_send.elapsed();
+
+    if waited_for > time::Duration::from_secs(1) && waited_for > (1.5 * self.timers.srtt) {
+      // Should retransmit things
+      // Formula from RFC
+      // let allowed_data_to_be_sent_count = self.send.una + self.send.wnd - 1;
+      let resend_size = std::cmp::min(self.outgoing.len() as u32, self.send.wnd as u32);
+
+      // If we have space in the window and the connection should be closing
+      // then we'll retransmit the fin.
+      if resend_size < self.send.wnd && self.closed {
+        self.tcph.fin = true;
+      }
+
+      let (head, tail) = self.outgoing.as_slices();
+      self.write(nic, self.send.una, head, tail, resend_size as usize)?;
+      self.send.nxt = self.send.una.wrapping_add(self.send.wnd as u32);
+    } else {
+      // Send new data if there's space in the window
+      if unsent == 0 && self.closed_at.is_some() {
+        // Nothing to do, all is sent!
+        return Ok(());
+      }
+
+      let allowed = self.send.wnd - unacked_count;
+
+      if allowed <= 0 {
+        return Ok(());
+      }
+
+      let send_count = std::cmp::min(unsent, allowed);
+
+      if send_count < allowed && self.closed && self.closed_at.is_none() {
+        self.tcp.fin = true;
+        self.closed_at = Some(self.send.nxt.wrapping_add(unsent));
+      }
+
+      let (head, tail) = self.outgoing.as_slices();
+
+      // we want self.unacked[unacked_count..];
+      //
+
+      self.write(
+        nic,
+        self.send.nxt,
+        &self.outgoing[unacked_count..(unacked_count + send_count)],
+      )?;
+    }
 
     return Ok(());
   }
@@ -321,7 +378,7 @@ impl TcpConnection {
 
     if !okay {
       eprintln!("Not ok will return");
-      self.write(nic, &[])?;
+      self.write(nic, self.send.nxt, &[], &[], 0)?;
       return Ok(self.packet_ready_action());
     }
 
@@ -364,7 +421,7 @@ impl TcpConnection {
       // FIXME: Not suppring write yet, so sending FIN should be fine
       if let TcpState::Established = self.state {
         self.tcph.fin = true;
-        self.write(nic, &[])?;
+        // self.write(nic, &[])?;
         self.state = TcpState::FinWait1;
       }
     }
@@ -400,7 +457,7 @@ impl TcpConnection {
         .wrapping_add(if tcph.fin() { 1 } else { 0 });
 
       // Send acknowledgement
-      self.write(nic, &[])?;
+      self.write(nic, self.send.nxt, &[], &[], 0)?;
     }
 
     if tcph.fin() {
@@ -408,7 +465,7 @@ impl TcpConnection {
         TcpState::FinWait2 => {
           // We're done with the connection
           eprintln!("THEY'VE FINED");
-          self.write(nic, &[]);
+          self.write(nic, self.send.nxt, &[], &[], 0)?;
           self.state = TcpState::TimeWait;
         }
         _ => unreachable!(),
@@ -423,18 +480,26 @@ impl TcpConnection {
     self.tcph.rst = true;
     self.tcph.sequence_number = 0;
     self.tcph.acknowledgment_number = 0;
-    self.write(nic, &[]);
+    self.write(nic, self.send.nxt, &[], &[], 0);
 
     return Ok(());
   }
 
-  fn write(&mut self, nic: &tun_tap::Iface, payload: &[u8]) -> io::Result<usize> {
+  fn write(
+    &mut self,
+    nic: &tun_tap::Iface,
+    seq_of_first_byte: u32,
+    payload1: &[u8],
+    payload2: &[u8],
+    limit: usize,
+  ) -> io::Result<usize> {
     let mut buf = [0u8; 1500];
-    self.tcph.sequence_number = self.send.nxt;
+
+    self.tcph.sequence_number = seq_of_first_byte;
     self.tcph.acknowledgment_number = self.recv.nxt;
 
-    dbg!(self.tcph.sequence_number);
-    dbg!(self.tcph.acknowledgment_number);
+    let max_data = std::cmp::min(limit, payload1.len() + payload2.len());
+
     let ip_payload_size = std::cmp::min(
       buf.len(),
       self.tcph.header_len() as usize + self.iph.header_len() as usize + payload.len(),
@@ -458,39 +523,88 @@ impl TcpConnection {
 
     // Write into unwritten_buf, the "write" method is kind of different between headers and buf, go
     // to function definition for more details
-    let written_payload_size = unwritten_buf.write(payload)?;
+    let written_payload_size = {
+      let mut written = 0;
+      let mut limit = max_data;
+
+      let p1l = std::cmp::min(limit, payload1.len());
+      written += unwritten.write(&payload1[..p1l])?;
+      limit -= written;
+
+      let p2l = std::cmp::min(limit, payload2.len());
+      written += unwritten.write(&payload2[..p2l])?;
+      written
+    };
+
     let unwritten_count = unwritten_buf.len();
+
+    let next_seq = seq_of_first_byte.wrapping_add(written_payload_size as u32);
 
     self.send.nxt = self.send.nxt.wrapping_add(written_payload_size as u32);
 
     if self.tcph.syn {
-      self.send.nxt = self.send.nxt.wrapping_add(1);
+      next_seq = next_seq.wrapping_add(1);
       self.tcph.syn = false;
     }
 
     if self.tcph.fin {
-      self.send.nxt = self.send.nxt.wrapping_add(1);
+      next_seq = next_seq.wrapping_add(1);
       self.tcph.fin = false;
+    }
+
+    if wrapping_lt(self.send.nxt, next_seq) {
+      self.send.nxt = next_seq;
     }
 
     nic.send(&buf[..buf.len() - unwritten_count])?;
 
     return Ok(written_payload_size);
   }
+
+  pub(crate) fn close(&mut self) -> io::Result<()> {
+    self.closed = true;
+
+    match self.state {
+      TcpState::SynRcvd | TcpState::Established => {
+        self.state = TcpState::FinWait1;
+      }
+      TcpState::FinWait1 | TcpState::FinWait2 => {}
+      _ => {
+        return Err(io::Error::new(
+          io::ErrorKind::NotConnected,
+          "already closing",
+        ))
+      }
+    }
+
+    return Ok(());
+  }
+}
+
+fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
+  // From RFC1323:
+  //     TCP determines if a data segment is "old" or "new" by testing
+  //     whether its sequence number is within 2**31 bytes of the left edge
+  //     of the window, and if it is not, discarding the data as "old".  To
+  //     insure that new data is never mistakenly considered old and vice-
+  //     versa, the left edge of the sender's window has to be at most
+  //     2**31 away from the right edge of the receiver's window.
+  lhs.wrapping_sub(rhs) > (1 << 31)
 }
 
 fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
-  // | -- S --- X --- E -- |
-  if start < x {
-    return x < end ||
-    // or this case is true
-    // | -- E --- S --- X |
-        end < start;
-  }
-  // | -- X --- E --- S -- |
-  else if start > x {
-    return x < end && end < start;
-  }
+  return wrapping_lt(start, x) && wrapping_lt(x, end);
+  // // | -- S --- X --- E -- |
+  // if start < x {
+  //   return x < end ||
+  //   // or this case is true
+  //   // | -- E --- S --- X |
+  //       end < start;
+  // }
+  // // | -- X --- E --- S -- |
+  // else if start > x {
+  //   return x < end && end < start;
+  // }
 
-  return false;
+  // return false;
 }

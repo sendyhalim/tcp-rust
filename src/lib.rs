@@ -49,13 +49,11 @@ fn packet_loop(
     assert_ne!(n, -1);
 
     if n == 0 {
-      // println!("TIMERS");
-      continue;
-      // let mut cmg = interface_handle.connection_manager.lock().unwrap();
+      let mut cmg = interface_handle.connection_manager.lock().unwrap();
 
-      // for connection in cmg.values() {
-      // connection.on_tick(&mut network_interface);
-      // }
+      for connection in cmg.connection_by_quad.values() {
+        connection.on_tick(&mut network_interface);
+      }
     }
 
     assert_eq!(n, 1);
@@ -343,7 +341,7 @@ impl TcpStream {
         )
       })?;
 
-    connection.closed = true;
+    connection.close()?;
 
     return Ok(());
   }
