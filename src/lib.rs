@@ -41,19 +41,21 @@ fn packet_loop(
   loop {
     let mut pfd = [nix::poll::PollFd::new(
       network_interface.as_raw_fd(),
-      nix::poll::PollFlags::POLLIN,
+      nix::poll::EventFlags::POLLIN,
     )];
 
-    let n = nix::poll::poll(&mut pfd[..], 1).map_err(|e| e.as_errno().unwrap())?;
+    let n = nix::poll::poll(&mut pfd[..], 10).map_err(|e| e.as_errno().unwrap())?;
 
     assert_ne!(n, -1);
 
     if n == 0 {
       let mut cmg = interface_handle.connection_manager.lock().unwrap();
 
-      for connection in cmg.connection_by_quad.values() {
-        connection.on_tick(&mut network_interface);
+      for connection in cmg.connection_by_quad.values_mut() {
+        connection.on_tick(&mut network_interface)?;
       }
+
+      continue;
     }
 
     assert_eq!(n, 1);
@@ -119,7 +121,7 @@ fn packet_loop(
             match quad_entry {
               Entry::Occupied(mut map_entry) => {
                 let readyAction = map_entry.get_mut().on_packet(
-                  &network_interface,
+                  &mut network_interface,
                   ipv4_header,
                   tcp_header,
                   &buf[data_start_index..nbytes],
@@ -163,7 +165,7 @@ fn packet_loop(
             }
           }
           Err(err) => {
-            eprintln!("Ignoring weird TCP packet {:?}", err);
+            // eprintln!("Ignoring weird TCP packet {:?}", err);
           }
         }
 
@@ -176,11 +178,11 @@ fn packet_loop(
         // );
       }
       Err(err) => {
-        eprintln!(
-          "Ignoring weird ipv4 packet {:?} {:x?}",
-          err,
-          &buf[packet_info_len..nbytes]
-        );
+        // eprintln!(
+        // "Ignoring weird ipv4 packet {:?} {:x?}",
+        // err,
+        // &buf[packet_info_len..nbytes]
+        // );
       }
     }
   }
@@ -341,9 +343,7 @@ impl TcpStream {
         )
       })?;
 
-    connection.close()?;
-
-    return Ok(());
+    return connection.close();
   }
 }
 
